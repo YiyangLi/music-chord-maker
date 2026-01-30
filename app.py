@@ -43,6 +43,25 @@ class ChordRequest(BaseModel):
     song: str
     artist: str
 
+class TransposeRequest(BaseModel):
+    chord_sheet: str
+    original_key: str
+    target_key: str
+    song: str
+    artist: str
+
+TRANSPOSE_PROMPT = """You are a music transposition expert. Transpose the given chord sheet from one key to another.
+
+RULES:
+1. Keep the EXACT same format and alignment
+2. Only change the chord names to match the new key
+3. Keep all lyrics exactly the same
+4. Keep all section labels exactly the same
+5. Update the "Key:" line to show the new key
+6. Maintain the precise spacing so chords stay aligned above the correct syllables
+
+Output ONLY the transposed chord sheet. No explanations."""
+
 @app.get("/health")
 async def health_check():
     token_set = bool(os.getenv("AI_BUILDER_TOKEN"))
@@ -135,11 +154,40 @@ async def read_root():
             .output-section {
                 margin-bottom: 25px;
             }
+            .output-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+            }
             .output-section label {
                 color: #ccc;
-                margin-bottom: 8px;
-                display: block;
                 font-weight: 500;
+            }
+            .key-selector {
+                display: none;
+                align-items: center;
+                gap: 10px;
+            }
+            .key-selector.show {
+                display: flex;
+            }
+            .key-selector label {
+                color: #ccc;
+                font-size: 14px;
+            }
+            .key-selector select {
+                padding: 8px 12px;
+                border: 2px solid #333;
+                border-radius: 6px;
+                background: #1a1a2e;
+                color: #00ff88;
+                font-size: 14px;
+                cursor: pointer;
+            }
+            .key-selector select:focus {
+                outline: none;
+                border-color: #e94560;
             }
             #output {
                 width: 100%;
@@ -265,7 +313,14 @@ async def read_root():
                     </div>
                 </div>
                 <div class="output-section">
-                    <label for="output">Chord Sheet</label>
+                    <div class="output-header">
+                        <label for="output">Chord Sheet</label>
+                        <div class="key-selector" id="key-selector">
+                            <label for="key-dropdown">Transpose to:</label>
+                            <select id="key-dropdown" onchange="transposeChords()">
+                            </select>
+                        </div>
+                    </div>
                     <textarea id="output" placeholder="Your chord sheet will appear here..." readonly></textarea>
                 </div>
                 <div class="loading" id="loading">
@@ -281,12 +336,85 @@ async def read_root():
         </div>
         <div class="toast" id="toast">Copied to clipboard!</div>
         <script>
+            // All 12 keys in chromatic order
+            const ALL_KEYS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+            const KEY_ALIASES = {'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#'};
+
+            let currentKey = null;
+            let originalChordSheet = null;
+            let isMinor = false;
+
+            function normalizeKey(key) {
+                // Extract just the root note (e.g., "C major" -> "C", "Am" -> "A")
+                const match = key.match(/^([A-G][#b]?)/i);
+                if (!match) return null;
+                let root = match[1];
+                root = root.charAt(0).toUpperCase() + root.slice(1);
+                // Convert flats to sharps for consistency
+                if (KEY_ALIASES[root]) root = KEY_ALIASES[root];
+                return root;
+            }
+
+            function detectKeyFromSheet(sheet) {
+                const match = sheet.match(/Key:\s*([A-G][#b]?\s*(?:major|minor|m)?)/i);
+                if (match) {
+                    return match[1].trim();
+                }
+                return null;
+            }
+
+            function checkIfMinor(key) {
+                // Check if key contains "minor" or ends with "m" (but not "major")
+                const lowerKey = key.toLowerCase();
+                return lowerKey.includes('minor') || (lowerKey.endsWith('m') && !lowerKey.includes('major'));
+            }
+
+            function formatKeyLabel(root, minor) {
+                return minor ? root + 'm' : root;
+            }
+
+            function populateKeyDropdown(detectedKey) {
+                const dropdown = document.getElementById('key-dropdown');
+                const keySelector = document.getElementById('key-selector');
+                dropdown.innerHTML = '';
+
+                const normalizedKey = normalizeKey(detectedKey);
+                if (!normalizedKey) {
+                    keySelector.classList.remove('show');
+                    return;
+                }
+
+                isMinor = checkIfMinor(detectedKey);
+
+                const keyIndex = ALL_KEYS.indexOf(normalizedKey);
+                if (keyIndex === -1) {
+                    keySelector.classList.remove('show');
+                    return;
+                }
+
+                // Build dropdown with current key in center
+                // Order: +6, +5, +4, +3, +2, +1, 0 (current), -1, -2, -3, -4, -5
+                const offsets = [6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5];
+
+                offsets.forEach(offset => {
+                    let idx = (keyIndex + offset + 12) % 12;
+                    const option = document.createElement('option');
+                    option.value = ALL_KEYS[idx];
+                    option.textContent = formatKeyLabel(ALL_KEYS[idx], isMinor);
+                    if (offset === 0) option.selected = true;
+                    dropdown.appendChild(option);
+                });
+
+                keySelector.classList.add('show');
+            }
+
             async function generateChords() {
                 const song = document.getElementById('song').value.trim();
                 const artist = document.getElementById('artist').value.trim();
                 const output = document.getElementById('output');
                 const generateBtn = document.getElementById('generate-btn');
                 const loading = document.getElementById('loading');
+                const keySelector = document.getElementById('key-selector');
 
                 if (!song || !artist) {
                     alert('Please enter both song name and artist.');
@@ -296,6 +424,7 @@ async def read_root():
                 generateBtn.disabled = true;
                 loading.classList.add('show');
                 output.value = '';
+                keySelector.classList.remove('show');
 
                 try {
                     const response = await fetch('/generate', {
@@ -313,10 +442,63 @@ async def read_root():
 
                     const data = await response.json();
                     output.value = data.chord_sheet;
+                    originalChordSheet = data.chord_sheet;
+
+                    // Detect key and show dropdown
+                    const detectedKey = detectKeyFromSheet(data.chord_sheet);
+                    if (detectedKey) {
+                        currentKey = detectedKey;
+                        populateKeyDropdown(detectedKey);
+                    }
                 } catch (error) {
                     output.value = 'Error: ' + error.message;
                 } finally {
                     generateBtn.disabled = false;
+                    loading.classList.remove('show');
+                }
+            }
+
+            async function transposeChords() {
+                const dropdown = document.getElementById('key-dropdown');
+                const targetKey = dropdown.value;
+                const output = document.getElementById('output');
+                const loading = document.getElementById('loading');
+                const song = document.getElementById('song').value.trim();
+                const artist = document.getElementById('artist').value.trim();
+
+                // Check if it's the original key
+                if (normalizeKey(currentKey) === targetKey) {
+                    output.value = originalChordSheet;
+                    return;
+                }
+
+                loading.classList.add('show');
+
+                try {
+                    const response = await fetch('/transpose', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            chord_sheet: originalChordSheet,
+                            original_key: currentKey,
+                            target_key: formatKeyLabel(targetKey, isMinor),
+                            song: song,
+                            artist: artist
+                        })
+                    });
+
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
+                        throw new Error(errorData.detail || `HTTP ${response.status}`);
+                    }
+
+                    const data = await response.json();
+                    output.value = data.chord_sheet;
+                } catch (error) {
+                    output.value = 'Error transposing: ' + error.message;
+                } finally {
                     loading.classList.remove('show');
                 }
             }
@@ -339,6 +521,9 @@ async def read_root():
                 document.getElementById('song').value = '';
                 document.getElementById('artist').value = '';
                 document.getElementById('output').value = '';
+                document.getElementById('key-selector').classList.remove('show');
+                currentKey = null;
+                originalChordSheet = null;
             }
 
             // Enter key triggers generate
@@ -395,6 +580,47 @@ async def generate_chords(request: ChordRequest):
         print(f"RAW CONTENT REPR: {repr(raw_content[:500]) if raw_content else 'None'}...")
 
         print(f"\nCHORD SHEET OUTPUT:")
+        print(f"{'-'*60}")
+        print(chord_sheet)
+        print(f"{'-'*60}\n")
+
+        return {"chord_sheet": chord_sheet}
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/transpose")
+async def transpose_chords(request: TransposeRequest):
+    try:
+        client = get_client()
+        print(f"\n{'='*60}")
+        print(f"TRANSPOSE: {request.original_key} -> {request.target_key}")
+        print(f"{'='*60}")
+
+        response = client.chat.completions.create(
+            model="deepseek",
+            messages=[
+                {"role": "system", "content": TRANSPOSE_PROMPT},
+                {"role": "user", "content": f"Transpose this chord sheet from {request.original_key} to {request.target_key}:\n\n{request.chord_sheet}"}
+            ],
+            temperature=1.0,
+            max_tokens=4096
+        )
+
+        if not response.choices:
+            raise ValueError("No response from API")
+
+        chord_sheet = response.choices[0].message.content.strip()
+
+        # Strip any preamble before "Key:"
+        if "Key:" in chord_sheet:
+            chord_sheet = chord_sheet[chord_sheet.index("Key:"):]
+
+        # Add song title header
+        chord_sheet = f"{request.song} - {request.artist}\n\n{chord_sheet}"
+
+        print(f"\nTRANSPOSED OUTPUT:")
         print(f"{'-'*60}")
         print(chord_sheet)
         print(f"{'-'*60}\n")
